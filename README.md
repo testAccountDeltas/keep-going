@@ -35,6 +35,13 @@ Then fully restart opencode (the plugin loads when the background service starts
   `ctx.session.prompt({ sessionID, text })` to continue.
 - It never touches the remote model/provider — it just triggers another local turn.
 
+
+## Only continues real work
+
+The plugin nudges **only after turns that used tools** (file edits, commands, etc.).
+A plain conversational answer (e.g. "what can you do?") is left alone — it never
+spams "continue" when there is nothing to continue.
+
 ## Safety / stopping conditions
 
 - **Max consecutive continues** (default `5`): after that it waits for you. The counter
