@@ -15,11 +15,7 @@
 const MAX = Number(process.env.OPENCODE_AUTOCONT_MAX ?? 5);
 const COOLDOWN = Number(process.env.OPENCODE_AUTOCONT_COOLDOWN_MS ?? 8000);
 const DEBUG = process.env.OPENCODE_AUTOCONT_DEBUG === "1";
-const NUDGE = process.env.OPENCODE_AUTOCONT_NUDGE ||
-  "[AUTO-CONTINUE] Продолжай выполнение задачи с места, где остановился. " +
-  "Если задача ПОЛНОСТЬЮ выполнена и проверена (сверь с роадмапом/todo) — ответь ровно одним словом: DONE. " +
-  "Если тебе нужно моё решение, которое нельзя вывести из контекста — задай конкретный вопрос. " +
-  "Иначе не останавливайся после одного шага, продолжай до результата.";
+const NUDGE = process.env.OPENCODE_AUTOCONT_NUDGE || "Продолжай. Если задача полностью готова — ответь одним словом: DONE. Если нужен мой ответ — задай вопрос.";
 
 export default {
   id: "keep-going",
