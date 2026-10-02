@@ -1,0 +1,13 @@
+{
+  "name": "keep-going",
+  "version": "1.0.0",
+  "description": "opencode v2 plugin that auto-continues a session when the agent stops mid-task, with max-continues, cooldown and a DONE stop condition.",
+  "type": "module",
+  "main": "keep-going.js",
+  "keywords": ["opencode", "opencode-plugin", "plugin", "automation", "agent", "continue", "session"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/testAccountDeltas/keep-going.git" },
+  "bugs": { "url": "https://github.com/testAccountDeltas/keep-going/issues" },
+  "homepage": "https://github.com/testAccountDeltas/keep-going#readme",
+  "engines": { "node": ">=18" }
+}

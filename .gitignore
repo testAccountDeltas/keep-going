@@ -1,0 +1,4 @@
+node_modules/
+_keep-going.log
+_*.log
+*.tgz
