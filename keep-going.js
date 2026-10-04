@@ -1,72 +1,117 @@
-// keep-going — плагин opencode v2.
-// Авто-продолжает сессию, ТОЛЬКО если ход реально делал работу инструментами
-// (session.tool.*). Чистый текстовый ответ (разговор, «что умеешь») не трогается.
-// Работает локально: модель/провайдер agy не меняются.
+// keep-going — автодожим «оборванного» хода.
 //
-// Остановка/защита: не больше MAX продолжений подряд (сброс при твоём ходе),
-// кулдаун, стоп если модель ответила DONE или задала вопрос.
-// env: OPENCODE_AUTOCONT_MAX (5), OPENCODE_AUTOCONT_COOLDOWN_MS (8000),
-//      OPENCODE_AUTOCONT_NUDGE, OPENCODE_AUTOCONT_DEBUG=1.
-
-const MAX = Number(process.env.OPENCODE_AUTOCONT_MAX ?? 5);
-const COOLDOWN = Number(process.env.OPENCODE_AUTOCONT_COOLDOWN_MS ?? 8000);
-const DEBUG = process.env.OPENCODE_AUTOCONT_DEBUG === "1";
-const NUDGE = process.env.OPENCODE_AUTOCONT_NUDGE || "Продолжай. Если задача полностью готова — ответь одним словом: DONE. Если нужен мой ответ — задай вопрос.";
-
-let STARTED = false;
+// Главная причина обрывов (подтверждено по opencode.db): Gemini отдаёт битый
+// function-call, провайдер возвращает finishReason=MALFORMED_FUNCTION_CALL,
+// opencode мапит его в finish="stop" → ход завершается с одним reasoning и
+// нулевым output. Пользователю приходится вручную писать «Продолжай».
+//
+// Здесь мы ловим это по событию session.step.ended (в нём есть rawFinish)
+// и сами отправляем короткий промпт-пинок.
+//
+// Env:
+//   OPENCODE_KG_OFF=1        — выключить
+//   OPENCODE_KG_MAX=5        — максимум автодожимов подряд на сессию
+//   OPENCODE_KG_COOLDOWN_MS  — пауза между ними (по умолчанию 6000)
+//   OPENCODE_KG_TEXT         — текст пинка (по умолчанию "continue")
+//   OPENCODE_KG_QUIET=1      — не писать лог
+const MAX = Number(process.env.OPENCODE_KG_MAX ?? 5);
+const COOLDOWN = Number(process.env.OPENCODE_KG_COOLDOWN_MS ?? 6000);
+const RETRY_TEXT = process.env.OPENCODE_KG_TEXT ?? "continue";
+const BAD = new Set(["malformed_function_call", "prohibited_content", "unexpected_tool_call"]);
+// Плагин инстанцируется дважды (две загрузки модуля) и перезагружается на лету при
+// правке файла. Поколение в globalThis: живым остаётся только последний инстанс —
+// иначе на один обрыв ушло бы два "continue", а hot-reload не применялся бы.
+const GEN = "__opencode_keep_going_gen__";
 
 export default {
   id: "keep-going",
   async setup(ctx) {
-    if (STARTED) return {};
-    STARTED = true;
+    if (process.env.OPENCODE_KG_OFF === "1") return {};
+    const myGen = (globalThis[GEN] = (globalThis[GEN] ?? 0) + 1);
     if (!ctx.event?.subscribe || !ctx.session?.prompt) return {};
-    let log = () => {};
-    if (DEBUG) { try { const fs = await import("node:fs"); const os = await import("node:os"); const p = os.homedir() + "/.config/opencode/plugin/_keep-going.log"; log = (m) => { try { fs.appendFileSync(p, new Date().toISOString() + " " + m + "\n"); } catch {} }; log("started max=" + MAX); } catch {} }
 
-    const count = new Map();     // авто-продолжений подряд
-    const lastAt = new Map();    // время последнего
-    const mine = new Map();      // следующий ход — наш (не сбрасывать счётчик)
-    const worked = new Map();    // в текущем ходе был вызов инструмента
-    const buf = new Map();       // текст текущего хода
-    const lastText = new Map();  // текст прошлого хода
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const LOG = os.homedir() + "/.config/opencode/plugin/_keep-going.log";
+    const QUIET = process.env.OPENCODE_KG_QUIET === "1";
+    const log = QUIET ? () => {} : (m) => {
+      try { fs.appendFileSync(LOG, new Date().toISOString().slice(0, 19).replace("T", " ") + " " + m + "\n"); } catch {}
+    };
+    try { if ((fs.statSync(LOG).size || 0) > 200000) fs.writeFileSync(LOG, ""); } catch {}
+    log("=== keep-going started (gen " + myGen + ", max=" + MAX + ") ===");
 
-    async function onDone(sid) {
+    const broken = new Map();   // sid -> последняя плохая причина в текущем прогоне
+    const produced = new Map(); // sid -> дал ли ПОСЛЕДНИЙ шаг текст/успешный тул
+    const count = new Map();    // sid -> сколько автодожимов подряд
+    const lastAt = new Map();
+
+    async function kick(sid) {
+      try {
+        const r = ctx.session.prompt({ sessionID: sid, text: RETRY_TEXT });
+        if (r && r.then) await r;
+        log("kick sent -> " + sid);
+      } catch (e) { log("kick failed: " + e.message); }
+    }
+
+    async function onEnd(sid) {
       if (!sid) return;
-      if (!worked.get(sid)) { log("no tools -> skip (разговор)"); return; } // главный гейт
-      const now = Date.now(), n = count.get(sid) ?? 0;
-      const t = (lastText.get(sid) || "").trim();
-      if (/(^|\s)DONE\.?\s*$/i.test(t) || /^DONE\b/i.test(t)) { count.set(sid, MAX); log("DONE -> stop"); return; }
-      if (/\?\s*$/.test(t)) { log("question -> skip"); return; }
-      if (n >= MAX) { log("cap"); return; }
+      const why = broken.get(sid);
+      broken.delete(sid);
+      if (!why) { count.set(sid, 0); return; }          // ход завершился нормально
+      if (produced.get(sid)) { count.set(sid, 0); log("bad=" + why + " но шаг что-то дал — не дожимаем"); return; }
+      const n = count.get(sid) ?? 0;
+      if (n >= MAX) { log("cap " + MAX + " reached, stop"); return; }
+      const now = Date.now();
       if (now - (lastAt.get(sid) ?? 0) < COOLDOWN) { log("cooldown"); return; }
-      count.set(sid, n + 1); lastAt.set(sid, now); mine.set(sid, true);
-      log("nudge #" + (n + 1));
-      try { const r = ctx.session.prompt({ sessionID: sid, text: NUDGE }); if (r?.then) await r; }
-      catch (e) { log("send err " + e.message); }
+      count.set(sid, n + 1); lastAt.set(sid, now);
+      log("BROKEN (" + why + ") -> auto-continue #" + (n + 1));
+      await kick(sid);
     }
 
     (async () => {
       try {
         const sub = await ctx.event.subscribe();
         for await (const ev of (sub.stream ?? sub)) {
+          if (globalThis[GEN] !== myGen) { log("superseded by gen " + globalThis[GEN] + ", exit"); return; }
           try {
             const d = ev.data || {};
             const sid = d.sessionID || ev.durable?.aggregateID;
-            if (!sid && !String(ev.type).startsWith("session.")) continue;
-            if (ev.type === "session.execution.started") {
-              if (sid) { if (mine.get(sid)) mine.set(sid, false); else count.set(sid, 0); worked.set(sid, false); buf.set(sid, ""); }
-            } else if (ev.type.startsWith("session.tool.")) {
-              if (sid) worked.set(sid, true);
-            } else if (ev.type === "session.text.delta") {
-              if (sid) buf.set(sid, (buf.get(sid) || "") + (d.delta || d.text || ""));
-            } else if (ev.type === "session.execution.succeeded") {
-              if (sid) { lastText.set(sid, buf.get(sid) || ""); await onDone(sid); }
+            switch (ev.type) {
+              case "session.execution.started":
+              case "session.step.started":
+                // produced считаем ПО ШАГУ: ход мог сделать 3 удачных тула,
+                // а последний шаг всё равно умер на битом function-call.
+                if (sid) { broken.delete(sid); produced.set(sid, false); }
+                break;
+              case "session.text.delta":
+                if (sid && (d.delta || d.text)) produced.set(sid, true);
+                break;
+              case "session.tool.success":
+                if (sid) produced.set(sid, true);
+                break;
+              case "session.step.failed": {
+                // транспортные обрывы CliRelay: "stream ended without finish_reason"
+                const msg = String(d.error?.data?.message ?? d.error?.message ?? "");
+                if (sid && /without finish_reason|GOAWAY|ECONNRESET|socket hang up|premature close/i.test(msg)) {
+                  broken.set(sid, "stream-truncated"); log("step.failed: " + msg.slice(0, 120));
+                }
+                break;
+              }
+              case "session.step.ended": {
+                const raw = String(d.rawFinish ?? "").toLowerCase();
+                if (sid && BAD.has(raw)) { broken.set(sid, raw); log("step.ended rawFinish=" + raw); }
+                break;
+              }
+              case "session.execution.succeeded":
+              case "session.execution.failed":
+                await onEnd(sid);
+                break;
             }
-          } catch (e) { log("ev " + e.message); }
+          } catch (e) { log("ev err " + e.message); }
         }
-      } catch (e) { log("loop " + e.message); }
+      } catch (e) { log("loop err " + e.message); }
     })();
+
     return {};
   },
 };

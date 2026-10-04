@@ -1,7 +1,7 @@
 {
   "name": "keep-going",
-  "version": "1.0.0",
-  "description": "opencode v2 plugin that auto-continues a session when the agent stops mid-task, with max-continues, cooldown and a DONE stop condition.",
+  "version": "1.1.0",
+  "description": "opencode v2 plugin that auto-retries a turn killed by a broken/empty model response (malformed_function_call or a truncated stream), with max-retries and cooldown guardrails.",
   "type": "module",
   "main": "keep-going.js",
   "keywords": ["opencode", "opencode-plugin", "plugin", "automation", "agent", "continue", "session"],

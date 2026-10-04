@@ -1,18 +1,19 @@
 # keep-going
 
-An [opencode](https://opencode.ai) v2 plugin that automatically continues a session
-when the agent stops mid-task — so you don't have to type "continue" every time.
-
-When a turn finishes (`session.execution.succeeded`) but the task isn't actually done,
-the plugin sends a short continuation prompt back into the same session. It runs entirely
-inside opencode and talks only to your local opencode server — it does not change your
-model or provider in any way.
+An [opencode](https://opencode.ai) v2 plugin that automatically retries a turn that
+died on a **broken/empty model response** — so you don't have to type "continue" by hand.
 
 ## Why
 
-Some models end their turn after a single logical step instead of carrying a multi-step
-task to the end. On long tasks that means constantly nudging the agent by hand. This plugin
-does that nudging for you, with guardrails so it never loops forever or burns tokens blindly.
+Some models (notably Gemini via Antigravity) occasionally emit a malformed tool call.
+The provider returns `finishReason = MALFORMED_FUNCTION_CALL`, opencode maps that to
+`finish = "stop"`, and the turn ends with a bit of reasoning and **zero output** — no text,
+no tool result. The task just stalls and you have to nudge it manually.
+
+This plugin detects exactly that situation and sends a short continuation prompt back into
+the same session, with guardrails so it never loops forever. It runs entirely inside
+opencode and talks only to your local opencode server — it does **not** change your model
+or provider.
 
 ## Install
 
@@ -26,44 +27,50 @@ Copy the plugin into opencode's auto-discovery folder:
 ~/.config/opencode/plugin/keep-going.js
 ```
 
-Then fully restart opencode (the plugin loads when the background service starts).
+Then fully restart opencode (plugins load when the background service starts).
 
 ## How it works
 
 - Subscribes to the opencode event stream (`ctx.event.subscribe`).
-- On `session.execution.succeeded` it inspects the last turn and, if warranted, calls
-  `ctx.session.prompt({ sessionID, text })` to continue.
-- It never touches the remote model/provider — it just triggers another local turn.
+- Tracks, **per step**, whether that step produced anything — a text delta
+  (`session.text.delta`) or a successful tool call (`session.tool.success`).
+- Flags a turn as broken when:
+  - `session.step.ended` reports a bad `rawFinish` — `malformed_function_call`,
+    `prohibited_content`, or `unexpected_tool_call`; or
+  - `session.step.failed` looks like a transport cut-off (`stream ended without
+    finish_reason`, `GOAWAY`, `ECONNRESET`, `socket hang up`, `premature close`).
+- On turn end (`session.execution.succeeded` / `failed`): if the turn was flagged broken
+  **and the last step produced nothing**, it calls `ctx.session.prompt({ sessionID, text })`
+  to continue. If the step actually produced text or a tool result, it leaves things alone.
 
-
-## Only continues real work
-
-The plugin nudges **only after turns that used tools** (file edits, commands, etc.).
-A plain conversational answer (e.g. "what can you do?") is left alone — it never
-spams "continue" when there is nothing to continue.
+Because the broken state is tracked per *step*, a turn that ran three good tools and then
+died on a malformed fourth call is still caught.
 
 ## Safety / stopping conditions
 
-- **Max consecutive continues** (default `5`): after that it waits for you. The counter
-  resets when you start a turn yourself.
-- **Cooldown** (default `8000` ms) between auto-continues.
-- **DONE sentinel**: the continuation prompt asks the model to reply exactly `DONE` when the
-  task is truly finished and verified; on `DONE` the plugin stops.
-- **Question guard**: if the last output ends with `?`, the plugin stays out of the way.
+- **Max consecutive retries** (default `5`): after that it waits for you. The counter
+  resets as soon as a turn completes normally.
+- **Cooldown** (default `6000` ms) between retries.
+- **Only broken turns**: it never nudges a turn that produced real output, so a plain
+  conversational answer is never interrupted.
+- **Hot-reload safe**: a generation guard in `globalThis` ensures only the latest loaded
+  instance is live, so one break never triggers two continues.
 
 ## Configuration (environment variables)
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPENCODE_AUTOCONT_MAX` | `5` | Max consecutive auto-continues per session |
-| `OPENCODE_AUTOCONT_COOLDOWN_MS` | `8000` | Cooldown between auto-continues (ms) |
-| `OPENCODE_AUTOCONT_NUDGE` | built-in | Override the continuation prompt text |
-| `OPENCODE_AUTOCONT_DEBUG` | off | Set to `1` to log actions to `plugin/_keep-going.log` |
+| `OPENCODE_KG_OFF` | off | Set to `1` to disable the plugin entirely |
+| `OPENCODE_KG_MAX` | `5` | Max consecutive auto-continues per session |
+| `OPENCODE_KG_COOLDOWN_MS` | `6000` | Cooldown between auto-continues (ms) |
+| `OPENCODE_KG_TEXT` | `continue` | Text of the continuation prompt |
+| `OPENCODE_KG_QUIET` | off | Set to `1` to suppress the diagnostic log (`plugin/_keep-going.log`) |
 
 ## Compatibility
 
-Built for the opencode **v2** plugin API (`export default { id, setup }`). The turn-end
-signal is `session.execution.succeeded`; `sessionID` is read from `event.data.sessionID`.
+Built for the opencode **v2** plugin API (`export default { id, setup }`). Uses
+`ctx.event.subscribe`, `ctx.session.prompt`, and the `session.step.ended` /
+`session.step.failed` events that carry `rawFinish` and error details.
 
 ## License
 
